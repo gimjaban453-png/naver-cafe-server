@@ -1,1 +1,1 @@
-web: python cafe_server_render버전.py
+web: gunicorn cafe_server_render버전:app
