@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, render_template_string
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import hashlib
 from datetime import datetime
 import os
@@ -7,31 +8,43 @@ import os
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'cafe_server_secret_key_2024'
 
-DB_PATH = "cafe_users.db"
+# ========================
+# Render PostgreSQL 연결
+# ========================
+# Render에서 PostgreSQL 생성하면 DATABASE_URL 환경변수가 자동으로 설정됨
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
+
+def get_db():
+    """PostgreSQL 연결"""
+    conn = psycopg2.connect(DATABASE_URL)
+    return conn
 
 # ========================
 # 데이터베이스 초기화
 # ========================
 def init_db():
-    """사용자 데이터베이스 초기화"""
-    if not os.path.exists(DB_PATH):
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                approved_at TIMESTAMP
-            )
-        """)
-        # 기본 관리자
-        cursor.execute("INSERT INTO users (username, password, status) VALUES (?, ?, 'approved')",
-                      ("admin", hashlib.sha256("admin1234".encode()).hexdigest()))
-        conn.commit()
-        conn.close()
+    """사용자 데이터베이스 초기화 (테이블 없으면 생성)"""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            approved_at TIMESTAMP
+        )
+    """)
+    # 기본 관리자 (없으면 추가)
+    cursor.execute("SELECT id FROM users WHERE username = 'admin'")
+    if cursor.fetchone() is None:
+        cursor.execute(
+            "INSERT INTO users (username, password, status) VALUES (%s, %s, 'approved')",
+            ("admin", hashlib.sha256("admin1234".encode()).hexdigest())
+        )
+    conn.commit()
+    conn.close()
 
 def hash_password(password):
     """비밀번호 해시"""
@@ -47,21 +60,23 @@ def api_register():
         data = request.get_json()
         username = data.get('username')
         password = data.get('password')
-        
+
         if not username or not password:
             return jsonify({"success": False, "message": "아이디와 비밀번호를 입력하세요"}), 400
-        
+
         try:
-            conn = sqlite3.connect(DB_PATH)
+            conn = get_db()
             cursor = conn.cursor()
-            cursor.execute("INSERT INTO users (username, password, status) VALUES (?, ?, 'pending')",
-                          (username, hash_password(password)))
+            cursor.execute(
+                "INSERT INTO users (username, password, status) VALUES (%s, %s, 'pending')",
+                (username, hash_password(password))
+            )
             conn.commit()
             conn.close()
             return jsonify({"success": True, "message": f"{username} 가입 신청 완료! 관리자 승인을 기다려주세요."}), 200
-        except sqlite3.IntegrityError:
+        except psycopg2.IntegrityError:
             return jsonify({"success": False, "message": "이미 존재하는 아이디입니다"}), 400
-    
+
     except Exception as e:
         return jsonify({"success": False, "message": f"오류: {str(e)}"}), 500
 
@@ -75,21 +90,21 @@ def api_login():
         data = request.get_json()
         username = data.get('username')
         password = data.get('password')
-        
+
         if not username or not password:
             return jsonify({"success": False, "message": "아이디와 비밀번호를 입력하세요"}), 400
-        
-        conn = sqlite3.connect(DB_PATH)
+
+        conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("SELECT password, status FROM users WHERE username = ?", (username,))
+        cursor.execute("SELECT password, status FROM users WHERE username = %s", (username,))
         result = cursor.fetchone()
         conn.close()
-        
+
         if not result:
             return jsonify({"success": False, "message": "등록되지 않은 아이디입니다"}), 401
-        
+
         stored_password, status = result
-        
+
         # 상태 확인
         if status == "pending":
             return jsonify({"success": False, "message": "가입 승인 대기 중입니다. 관리자 승인을 기다려주세요."}), 401
@@ -97,13 +112,13 @@ def api_login():
             return jsonify({"success": False, "message": "가입이 거절되었습니다."}), 401
         elif status != "approved":
             return jsonify({"success": False, "message": "비활성화된 계정입니다"}), 401
-        
+
         # 비밀번호 확인
         if stored_password == hash_password(password):
             return jsonify({"success": True, "message": "로그인 성공", "username": username}), 200
         else:
             return jsonify({"success": False, "message": "비밀번호가 틀렸습니다"}), 401
-    
+
     except Exception as e:
         return jsonify({"success": False, "message": f"오류: {str(e)}"}), 500
 
@@ -116,24 +131,24 @@ def api_get_pending_users():
     try:
         data = request.get_json()
         admin_password = data.get('admin_password')
-        
+
         if admin_password != "admin1234":
             return jsonify({"success": False, "message": "관리자 비밀번호가 틀렸습니다"}), 401
-        
-        conn = sqlite3.connect(DB_PATH)
+
+        conn = get_db()
         cursor = conn.cursor()
         cursor.execute("SELECT username, status, created_at FROM users ORDER BY created_at DESC")
         users = cursor.fetchall()
         conn.close()
-        
+
         user_list = [{
-            "username": u[0], 
+            "username": u[0],
             "status": u[1],
-            "created_at": u[2]
+            "created_at": str(u[2]) if u[2] else None
         } for u in users if u[0] != "admin"]
-        
+
         return jsonify({"success": True, "users": user_list}), 200
-    
+
     except Exception as e:
         return jsonify({"success": False, "message": f"오류: {str(e)}"}), 500
 
@@ -147,18 +162,21 @@ def api_approve_user():
         data = request.get_json()
         username = data.get('username')
         admin_password = data.get('admin_password')
-        
+
         if admin_password != "admin1234":
             return jsonify({"success": False, "message": "관리자 비밀번호가 틀렸습니다"}), 401
-        
-        conn = sqlite3.connect(DB_PATH)
+
+        conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("UPDATE users SET status = 'approved', approved_at = CURRENT_TIMESTAMP WHERE username = ?", (username,))
+        cursor.execute(
+            "UPDATE users SET status = 'approved', approved_at = CURRENT_TIMESTAMP WHERE username = %s",
+            (username,)
+        )
         conn.commit()
         conn.close()
-        
+
         return jsonify({"success": True, "message": f"{username} 승인 완료"}), 200
-    
+
     except Exception as e:
         return jsonify({"success": False, "message": f"오류: {str(e)}"}), 500
 
@@ -172,18 +190,18 @@ def api_reject_user():
         data = request.get_json()
         username = data.get('username')
         admin_password = data.get('admin_password')
-        
+
         if admin_password != "admin1234":
             return jsonify({"success": False, "message": "관리자 비밀번호가 틀렸습니다"}), 401
-        
-        conn = sqlite3.connect(DB_PATH)
+
+        conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("UPDATE users SET status = 'rejected' WHERE username = ?", (username,))
+        cursor.execute("UPDATE users SET status = 'rejected' WHERE username = %s", (username,))
         conn.commit()
         conn.close()
-        
+
         return jsonify({"success": True, "message": f"{username} 거절 완료"}), 200
-    
+
     except Exception as e:
         return jsonify({"success": False, "message": f"오류: {str(e)}"}), 500
 
@@ -197,18 +215,18 @@ def api_delete_user():
         data = request.get_json()
         username = data.get('username')
         admin_password = data.get('admin_password')
-        
+
         if admin_password != "admin1234":
             return jsonify({"success": False, "message": "관리자 비밀번호가 틀렸습니다"}), 401
-        
-        conn = sqlite3.connect(DB_PATH)
+
+        conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM users WHERE username = ?", (username,))
+        cursor.execute("DELETE FROM users WHERE username = %s", (username,))
         conn.commit()
         conn.close()
-        
+
         return jsonify({"success": True, "message": f"{username} 삭제 완료"}), 200
-    
+
     except Exception as e:
         return jsonify({"success": False, "message": f"오류: {str(e)}"}), 500
 
@@ -403,10 +421,11 @@ def admin_page():
 # ========================
 # 서버 실행
 # ========================
+init_db()
+
 if __name__ == '__main__':
-    init_db()
     port = int(os.environ.get('PORT', 5000))
     print("=" * 50)
-    print("🚀 서버 시작!")
+    print("🚀 서버 시작! (PostgreSQL)")
     print("=" * 50)
     app.run(host='0.0.0.0', port=port, debug=False)
